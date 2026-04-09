@@ -25,6 +25,7 @@ import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { loadPluginConfig, saveGlobalPluginConfig } from "./plugin-config.js";
 import { type AgentConfig, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType } from "./types.js";
 import {
   type AgentActivity,
@@ -428,6 +429,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     manager.clearCompleted();           // preserve existing behavior
+    // Re-apply plugin config so changes to config files are picked up on session start
+    applyPluginConfig(loadPluginConfig(ctx.cwd));
   });
 
   pi.on("session_switch", () => { manager.clearCompleted(); });
@@ -463,6 +466,17 @@ export default function (pi: ExtensionAPI) {
   let defaultJoinMode: JoinMode = 'smart';
   function getDefaultJoinMode(): JoinMode { return defaultJoinMode; }
   function setDefaultJoinMode(mode: JoinMode) { defaultJoinMode = mode; }
+
+  /** Apply a PluginConfig to all runtime settings. */
+  function applyPluginConfig(cfg: ReturnType<typeof loadPluginConfig>) {
+    if (cfg.max_concurrent != null) manager.setMaxConcurrent(cfg.max_concurrent);
+    if (cfg.max_turns != null) setDefaultMaxTurns(cfg.max_turns === 0 ? undefined : cfg.max_turns);
+    if (cfg.grace_turns != null) setGraceTurns(cfg.grace_turns);
+    if (cfg.join_mode != null) setDefaultJoinMode(cfg.join_mode);
+  }
+
+  // Load and apply plugin config on startup
+  applyPluginConfig(loadPluginConfig(process.cwd()));
 
   // ---- Batch tracking for smart join mode ----
   // Collects background agent IDs spawned in the current turn for smart grouping.
@@ -1605,6 +1619,15 @@ ${systemPrompt}
     ctx.ui.notify(`Created ${targetPath}`, "info");
   }
 
+  /** Save a setting to the global config file, notifying on failure. */
+  function trySaveConfig(ctx: ExtensionCommandContext, updates: ReturnType<typeof loadPluginConfig>) {
+    try {
+      saveGlobalPluginConfig(updates);
+    } catch (err) {
+      ctx.ui.notify(`Failed to save settings: ${err instanceof Error ? err.message : String(err)}`, "warning");
+    }
+  }
+
   async function showSettings(ctx: ExtensionCommandContext) {
     const choice = await ctx.ui.select("Settings", [
       `Max concurrency (current: ${manager.getMaxConcurrent()})`,
@@ -1620,6 +1643,7 @@ ${systemPrompt}
         const n = parseInt(val, 10);
         if (n >= 1) {
           manager.setMaxConcurrent(n);
+          trySaveConfig(ctx, { max_concurrent: n });
           ctx.ui.notify(`Max concurrency set to ${n}`, "info");
         } else {
           ctx.ui.notify("Must be a positive integer.", "warning");
@@ -1631,9 +1655,11 @@ ${systemPrompt}
         const n = parseInt(val, 10);
         if (n === 0) {
           setDefaultMaxTurns(undefined);
+          trySaveConfig(ctx, { max_turns: 0 });
           ctx.ui.notify("Default max turns set to unlimited", "info");
         } else if (n >= 1) {
           setDefaultMaxTurns(n);
+          trySaveConfig(ctx, { max_turns: n });
           ctx.ui.notify(`Default max turns set to ${n}`, "info");
         } else {
           ctx.ui.notify("Must be 0 (unlimited) or a positive integer.", "warning");
@@ -1645,6 +1671,7 @@ ${systemPrompt}
         const n = parseInt(val, 10);
         if (n >= 1) {
           setGraceTurns(n);
+          trySaveConfig(ctx, { grace_turns: n });
           ctx.ui.notify(`Grace turns set to ${n}`, "info");
         } else {
           ctx.ui.notify("Must be a positive integer.", "warning");
@@ -1659,6 +1686,7 @@ ${systemPrompt}
       if (val) {
         const mode = val.split(" ")[0] as JoinMode;
         setDefaultJoinMode(mode);
+        trySaveConfig(ctx, { join_mode: mode });
         ctx.ui.notify(`Default join mode set to ${mode}`, "info");
       }
     }
